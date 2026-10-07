@@ -244,11 +244,29 @@ def generate_videos(
         "Content-Type": "application/json",
     }
     base_url = _base_url()
-    create_url = f"{base_url}/v2/video_generation"
+    is_media_api = "aiapi" in base_url or "/v1" in base_url
+    if is_media_api:
+        create_url = f"{base_url}/v1/media/video"
+        payload = {
+            "model": "MiniMax-H3",
+            "prompt": term,
+            "duration": duration,
+            "resolution": resolution,
+            "aspect_ratio": aspect.value,
+        }
+    else:
+        create_url = f"{base_url}/v2/video_generation"
+        payload = {
+            "model": DEFAULT_MODEL_ID,
+            "content": [{"type": "text", "text": term}],
+            "resolution": resolution,
+            "duration": duration,
+            "ratio": aspect.value,
+        }
     logger.info(
-        "generating video with Metaso MiniMax H3: "
+        "generating video with MiniMax H3: "
         f"resolution={resolution}, ratio={aspect.value}, duration={duration}s, "
-        f"prompt_length={len(term)}"
+        f"prompt_length={len(term)}, endpoint={create_url}"
     )
 
     # POST 超时或 5xx 发生时，远端可能已经创建并计费。接口没有提供客户端
@@ -362,7 +380,11 @@ def _wait_for_task(
         1.0,
         60.0,
     )
-    query_url = f"{base_url}/v2/query/video_generation/{quote(task_id, safe='')}"
+    is_media_api = "aiapi" in base_url or "/v1" in base_url
+    if is_media_api:
+        query_url = f"{base_url}/v1/media/video/{quote(task_id, safe='')}"
+    else:
+        query_url = f"{base_url}/v2/query/video_generation/{quote(task_id, safe='')}"
     consecutive_failures = 0
 
     while True:
@@ -399,6 +421,25 @@ def _wait_for_task(
                     task_id=task_id,
                 )
             body = response.json()
+            if is_media_api:
+                status = str(body.get("status") or "").strip().lower()
+                logger.info(f"MiniMax H3 task status: id={task_id}, status={status}")
+                if status in ("success", "succeeded"):
+                    video_url = body.get("video_url")
+                    return {"content": {"url": video_url}, "duration": 4}
+                if status in ("failed", "error"):
+                    raise MetasoMiniMaxError(
+                        f"MiniMax H3 video generation failed: id={task_id}, detail={body.get('error')}",
+                        task_id=task_id,
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MetasoMiniMaxUnconfirmedTaskError(
+                        f"MiniMax H3 task is still running after timeout: id={task_id}",
+                        task_id=task_id,
+                    )
+                time.sleep(min(poll_interval, remaining))
+                continue
             task = body.get("task") if isinstance(body, dict) else None
             if not isinstance(task, dict):
                 raise MetasoMiniMaxUnconfirmedTaskError(
